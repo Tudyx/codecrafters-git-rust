@@ -1,13 +1,20 @@
 use anyhow::{anyhow, ensure};
 use clap::{Parser, Subcommand};
-use flate2::read::ZlibDecoder;
+use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
+use sha1::{Digest, Sha1};
 use std::{
     fs,
     io::{self, Read, Write},
     path::PathBuf,
 };
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    if let Err(err) = try_main() {
+        eprintln!("fatal: {err}");
+    }
+}
+
+fn try_main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     match args.command {
@@ -22,7 +29,7 @@ fn main() -> anyhow::Result<()> {
             // `hash` is the hex represenation of 20 bytes so it size must be 40.
             ensure!(
                 hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()),
-                "fatal: Not a valid object name {hash}"
+                "Not a valid object name {hash}"
             );
             let (dir, rest) = hash.split_at(2);
             let object = PathBuf::from(".git/objects").join(dir).join(rest);
@@ -36,6 +43,30 @@ fn main() -> anyhow::Result<()> {
                 .position(|&byte| byte == b'\0')
                 .ok_or_else(|| anyhow!("invalid object content"))?;
             io::stdout().write_all(&object[separator_position + 1..])?;
+        }
+        Command::HashObject { file, write } => {
+            let mut file_content = fs::read(file)?;
+            let mut object = format!("blob {}\0", file_content.len()).into_bytes();
+            object.append(&mut file_content);
+
+            let mut hasher = Sha1::new();
+            hasher.update(&object);
+            let sha1 = hasher.finalize();
+            let sha1 = base16ct::lower::encode_string(&sha1);
+            println!("{sha1}");
+
+            if write {
+                let (dir, rest) = sha1.split_at(2);
+                let parent = PathBuf::from(".git/objects").join(dir);
+                let object_path = parent.join(rest);
+
+                let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(&object)?;
+                let compressed = encoder.finish()?;
+
+                fs::create_dir_all(&parent)?;
+                fs::write(object_path, compressed)?;
+            }
         }
     };
     Ok(())
@@ -62,8 +93,9 @@ enum Command {
         #[arg(short = 'p')]
         hash: String,
     },
-    // CatFile2 {
-    //     #[arg(short = 'c')]
-    //     hash: [u8; 40],
-    // },
+    HashObject {
+        file: PathBuf,
+        #[arg(short)]
+        write: bool,
+    },
 }
