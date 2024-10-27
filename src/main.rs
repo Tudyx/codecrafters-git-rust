@@ -1,10 +1,11 @@
-use anyhow::{anyhow, ensure};
+use anyhow::{anyhow, bail, ensure, Context};
 use clap::{Parser, Subcommand};
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use sha1::{Digest, Sha1};
 use std::{
+    ffi::CStr,
     fs,
-    io::{self, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     path::PathBuf,
 };
 
@@ -25,24 +26,36 @@ fn try_main() -> anyhow::Result<()> {
             fs::write(".git/HEAD", "ref: refs/heads/main\n").unwrap();
             println!("Initialized git directory")
         }
-        Command::CatFile { hash } => {
+        Command::CatFile { hash, pretty_print } => {
+            if !pretty_print {
+                eprintln!("We only handle the pretty print option for now");
+                return Ok(());
+            }
+
             // `hash` is the hex represenation of 20 bytes so it size must be 40.
             ensure!(
                 hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()),
                 "Not a valid object name {hash}"
             );
+
             let (dir, rest) = hash.split_at(2);
             let object = PathBuf::from(".git/objects").join(dir).join(rest);
-            let object = fs::read(object)?;
-            let mut z_decoder = ZlibDecoder::new(object.as_slice());
+            let object = fs::File::open(&object).context(format!("opening {object:?}"))?;
+            let z_decoder = ZlibDecoder::new(object);
+            let mut z_decoder = BufReader::new(z_decoder);
             let mut object = Vec::new();
-            z_decoder.read_to_end(&mut object)?;
-            // If split_once for slice would be stable it would be perfect
-            let separator_position = object
-                .iter()
-                .position(|&byte| byte == b'\0')
-                .ok_or_else(|| anyhow!("invalid object content"))?;
-            io::stdout().write_all(&object[separator_position + 1..])?;
+            // blob <size>\0<content>
+            let n = z_decoder
+                .read_until(0, &mut object)
+                .context("reading the header")?;
+            let header = CStr::from_bytes_with_nul(&object[..n])?.to_str()?;
+            let (kind, size) = header.split_once(' ').context("spliting the header")?;
+            ensure!(kind == "blob", "we only know how to print blob");
+            let size = size.parse::<u64>().context("parsing the size")?;
+
+            let mut blob = z_decoder.take(size);
+
+            io::copy(&mut blob, &mut io::stdout()).context("piping object content to stdout")?;
         }
         Command::HashObject { file, write } => {
             let mut file_content = fs::read(file)?;
@@ -89,13 +102,18 @@ enum Command {
     Init,
     // CatFile { hash: Box<[u8; 40]> },
     CatFile {
-        /// Pretty print the object
-        #[arg(short = 'p')]
+        /// SHA-1 hash of the object in hexadecimal representation.
         hash: String,
+
+        #[arg(short)]
+        pretty_print: bool,
     },
     HashObject {
         file: PathBuf,
         #[arg(short)]
         write: bool,
+    },
+    LsTree {
+        hash: String,
     },
 }
