@@ -1,5 +1,6 @@
-use anyhow::{anyhow, bail, ensure, Context};
+use anyhow::{bail, ensure, Context};
 use clap::{Parser, Subcommand};
+use core::fmt;
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use sha1::{Digest, Sha1};
 use std::{
@@ -25,39 +26,22 @@ fn try_main() -> anyhow::Result<()> {
             fs::create_dir(".git/objects").unwrap();
             fs::create_dir(".git/refs").unwrap();
             fs::write(".git/HEAD", "ref: refs/heads/main\n").unwrap();
-            println!("Initialized git directory")
+            println!("Initialized git directory");
         }
         Command::CatFile { hash, pretty_print } => {
-            if !pretty_print {
-                eprintln!("We only handle the pretty print option for now");
-                return Ok(());
-            }
-
-            // `hash` is the hex represenation of 20 bytes so it size must be 40.
             ensure!(
-                hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()),
-                "Not a valid object name {hash}"
+                pretty_print,
+                "We only handle the pretty print option -p for now"
             );
 
-            let (dir, rest) = hash.split_at(2);
-            let object = PathBuf::from(".git/objects").join(dir).join(rest);
-            let object = fs::File::open(&object).context(format!("opening {object:?}"))?;
-            let z_decoder = ZlibDecoder::new(object);
-            let mut z_decoder = BufReader::new(z_decoder);
-            let mut object = Vec::new();
-            // blob <size>\0<content>
-            let n = z_decoder
-                .read_until(0, &mut object)
-                .context("reading the header")?;
-            let header = CStr::from_bytes_with_nul(&object[..n])?.to_str()?;
-            let (kind, size) = header.split_once(' ').context("spliting the header")?;
-            ensure!(kind == "blob", "we only know how to print blob");
-            let size = size.parse::<u64>().context("parsing the size")?;
-
-            // Takes protects from zip bomb.
-            let mut blob = z_decoder.take(size);
-
-            io::copy(&mut blob, &mut io::stdout()).context("piping object content to stdout")?;
+            let object = Object::from_sha1(&hash)?;
+            match object {
+                Object::Blob(mut reader) => {
+                    io::copy(&mut reader, &mut io::stdout())
+                        .context("piping object content to stdout")?;
+                }
+                Object::Tree(_) => bail!("we don't know how to print tree"),
+            }
         }
         Command::HashObject { file, write } => {
             // 1. Add the header
@@ -100,12 +84,12 @@ fn try_main() -> anyhow::Result<()> {
                 println!("{sha1}");
             }
         }
-        Command::LsTree { hash } => {
+        Command::LsTree { hash, name_only } => {
             ensure!(
                 hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()),
                 "Not a valid object name {hash}"
             );
-            parse_tree(&hash)?;
+            parse_tree(&hash, name_only)?;
         }
     };
     Ok(())
@@ -135,92 +119,95 @@ where
     // TODO: impl write_vectored
 }
 
-fn parse_tree(hash: &str) -> anyhow::Result<()> {
-    let (dir, rest) = hash.split_at(2);
-    let object = PathBuf::from(".git/objects").join(dir).join(rest);
-    let object = fs::read(object)?;
-    let mut z_decoder = ZlibDecoder::new(object.as_slice());
-    let mut object = Vec::new();
-    // For now we load the whole object in memory, hoping it wont't be to big.
-    z_decoder.read_to_end(&mut object)?;
-    println!("full object:");
-    std::io::stdout().write_all(&object).unwrap();
-    println!("\n-----------------");
+// Here there is not separator between the entries of the tree, they all start by a number but this could
+// be melt with the sha1 bytes, so we can't have a "split" approache. In other words the format is not self describing.
+fn parse_tree(hash: &str, name_only: bool) -> anyhow::Result<()> {
+    let object = Object::from_sha1(hash)?;
 
-    let mut object_bytes = object.iter();
-    let whitespace = object_bytes
-        .position(|byte| byte == &b' ')
-        .ok_or_else(|| anyhow!("invalid object content"))?;
-    let kind = &object[..whitespace];
-    std::io::stdout().write_all(kind).unwrap();
-    object_bytes
-        .position(|&byte| byte == b'\0')
-        .ok_or_else(|| anyhow!("invalid object content"))?;
-    match kind {
-        b"tree" => (),
-        _ => bail!("not a tree object"),
+    let Object::Tree(mut reader) = object else {
+        bail!("not a tree object");
     };
 
-    let whitespace = object_bytes
-        .position(|byte| byte == &b' ')
-        .ok_or_else(|| anyhow!("invalid object content"))?;
-    let mode = &object[..whitespace];
-    std::io::stdout().write_all(mode).unwrap();
+    let mut mode_buf = Vec::with_capacity(6);
+    let mut name_buf = Vec::new();
+    let mut hash_buf = [0; 20];
 
-    let whitespace = object_bytes
-        .position(|byte| byte == &b' ')
-        .ok_or_else(|| anyhow!("invalid object content"))?;
-    let mode = &object[..whitespace];
-    std::io::stdout().write_all(mode).unwrap();
-    // TODO: while stream peak and consume the object
-    // while stream.n
+    let mut stdout = io::stdout().lock();
+    loop {
+        name_buf.clear();
+        mode_buf.clear();
+        let n = reader.read_until(b' ', &mut mode_buf)?;
+        if n == 0 {
+            break;
+        }
 
-    // tree <size>\0<mode> <name>\0<20_byte_sha><mode> <name>\0<20_byte_sha><mode> <name>\0<20_byte_sha>
-    // Here there is not separator beween the entries of the tree, they all start by a number but this could
-    // be melt with the sha1 bytes, so we can't have a "split" appraoche.
-    // So we need to track where we at when reading the tree, so we will use a reader.
+        // Why they encode the mode in ASCII and not as an integer?
+        let mode = std::str::from_utf8(&mode_buf[..mode_buf.len() - 1])?;
 
-    // io::stdout().write_all(content)?;
+        let n = reader
+            .read_until(0, &mut name_buf)
+            .context("reading the header")?;
+        let name = CStr::from_bytes_with_nul(&name_buf[..n])?.to_str()?;
 
-    // for entry in conenet
+        reader.read_exact(&mut hash_buf)?;
+        let hex_hash = base16ct::lower::encode_string(&hash_buf);
+        if name_only {
+            writeln!(stdout, "{name}")?;
+        } else {
+            let object = Object::from_sha1(&hex_hash)?;
+            writeln!(stdout, "{mode:0>6} {object} {hex_hash}    {name}")?;
+        }
+    }
+
     Ok(())
 }
 
-enum Object {
-    Blob(Vec<u8>),
-    Tree,
+// Each object have an header
+// <kind> <size>\0
+enum Object<R> {
+    Blob(R),
+    Tree(R),
 }
 
-// impl Object {
-//     fn from_disk(sha: String) -> anyhow::Result<Self> {
-//         ensure!(
-//             sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()),
-//             "fatal: Not a valid object name {sha}"
-//         );
-//         let (dir, rest) = sha.split_at(2);
-//         let object = PathBuf::from(".git/objects").join(dir).join(rest);
-//         let object = fs::read(object)?;
-//         let mut z_decoder = ZlibDecoder::new(object.as_slice());
-//         let mut object = Vec::new();
-//         z_decoder.read_to_end(&mut object)?;
-//         // If split_once for slice would be stable it would be perfect
-//         let null_character = object
-//             .iter()
-//             .position(|&byte| byte == b'\0')
-//             .ok_or_else(|| anyhow!("invalid object content"))?;
-//         let content = &object[null_character + 1..];
-//         let whitespace = object[..null_character]
-//             .iter()
-//             .position(|&byte| byte == b'_')
-//             .ok_or_else(|| anyhow!("invalid object content"))?;
-//         let kind = &object[..whitespace];
-//         Ok(match kind {
-//             b"blob" => Object::Blob(object),
-//             b"tree" => Object::Tree,
-//             _ => bail!("Unsupported object kind {}", String::from_utf8_lossy(kind)),
-//         })
-//     }
-// }
+impl Object<()> {
+    fn from_sha1(hash: &str) -> anyhow::Result<Object<impl BufRead>> {
+        // `hash` is the hex representation of 20 bytes so it size must be 40.
+        ensure!(
+            hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "Not a valid object name {hash}"
+        );
+
+        let (dir, rest) = hash.split_at(2);
+        let object = PathBuf::from(".git/objects").join(dir).join(rest);
+        let object = fs::File::open(&object).context(format!("opening {object:?}"))?;
+        let z_decoder = ZlibDecoder::new(object);
+        let mut z_decoder = BufReader::new(z_decoder);
+        let mut object = Vec::new();
+        // blob <size>\0<content>
+        let n = z_decoder
+            .read_until(0, &mut object)
+            .context("reading the header")?;
+        let header = CStr::from_bytes_with_nul(&object[..n])?.to_str()?;
+        let (kind, size) = header.split_once(' ').context("spliting the header")?;
+        let size = size.parse::<u64>().context("parsing the size")?;
+        // Takes protects from zip bomb.
+        let object = z_decoder.take(size);
+        Ok(match kind {
+            "blob" => Object::Blob(object),
+            "tree" => Object::Tree(object),
+            _ => bail!("unknown object kind: {kind}"),
+        })
+    }
+}
+
+impl<R> fmt::Display for Object<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Object::Blob(_) => write!(f, "blob"),
+            Object::Tree(_) => write!(f, "tree"),
+        }
+    }
+}
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -248,5 +235,7 @@ enum Command {
     },
     LsTree {
         hash: String,
+        #[arg(long)]
+        name_only: bool,
     },
 }
