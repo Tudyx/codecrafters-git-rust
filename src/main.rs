@@ -11,6 +11,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// TODO: maybe I corrupted my git repository?
+
 fn main() {
     if let Err(err) = try_main() {
         // We try to format the errors as git does.
@@ -58,7 +60,9 @@ fn try_main() -> anyhow::Result<()> {
         }
         Command::WriteTree => {
             let working_dir = env::current_dir()?;
-            write_tree(&working_dir)?;
+            let sha1 = write_tree(&working_dir)?;
+            let sha1 = base16ct::lower::encode_string(&sha1);
+            println!("{sha1}");
         }
     };
     Ok(())
@@ -88,7 +92,12 @@ where
     // TODO: impl write_vectored
 }
 
-fn write_tree(dir: &Path) -> anyhow::Result<()> {
+enum Entry {
+    Dir,
+    File,
+}
+
+fn write_tree(dir: &Path) -> anyhow::Result<sha1::digest::Output<sha1::Sha1>> {
     let mut tree_entries = Vec::new();
     let mut names_len = 0;
     for entry in fs::read_dir(dir)? {
@@ -99,19 +108,17 @@ fn write_tree(dir: &Path) -> anyhow::Result<()> {
         }
 
         if path.is_dir() {
-            write_tree(&path)?;
-            // FIXME: here we should do
-            //  tree_entries.push((sha1, entry.file_name()))
-            // Does write_tree should return sha1 ?
+            let sha1 = write_tree(&path)?;
+            let file_name = entry.file_name().into_string().unwrap();
+            // minus one because the mode of dir rectory are encoded will less byte.
+            names_len += file_name.len() - 1;
+            tree_entries.push((sha1, file_name, Entry::Dir))
         } else {
+            // Each files are a blob object.
             let sha1 = hash_object(&entry.path(), true)?;
-            let file_name = entry
-                .file_name()
-                .to_str()
-                .ok_or_else(|| anyhow!("file must be valid utf-8"))?
-                .to_string();
+            let file_name = entry.file_name().into_string().unwrap();
             names_len += file_name.len();
-            tree_entries.push((sha1, file_name))
+            tree_entries.push((sha1, file_name, Entry::File))
         }
     }
     let tmp_path = env::temp_dir().join("tmp_tree");
@@ -122,10 +129,17 @@ fn write_tree(dir: &Path) -> anyhow::Result<()> {
         hash: Sha1::new(),
         writer: ZlibEncoder::new(tmp, Compression::default()),
     };
+    // 20 the sha1, 6 the mode, 1 the \0 and 1 the whitespace
     let entries_len = names_len + tree_entries.len() * (20 + 6 + 1 + 1);
     write!(hasher, "tree {entries_len}\0")?;
-    for (sha1, file_name) in tree_entries {
-        write!(hasher, "100644 {file_name}\0")?;
+    tree_entries.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+    for (sha1, file_name, kind) in tree_entries {
+        match kind {
+            // By observing git, the leading 0 displayed for dir mode is note encoded.
+            Entry::Dir => write!(hasher, "40000")?,
+            Entry::File => write!(hasher, "100644")?,
+        }
+        write!(hasher, " {file_name}\0")?;
         hasher.write_all(&sha1)?;
     }
 
@@ -138,18 +152,17 @@ fn write_tree(dir: &Path) -> anyhow::Result<()> {
     let object_path = parent.join(rest);
     fs::create_dir_all(&parent).context(format!("creating {parent:?}"))?;
     fs::rename(tmp_path, object_path)?;
-    println!("{sha1}");
 
-    Ok(())
+    Ok(hash)
 }
 
 fn hash_object(file: &Path, write: bool) -> anyhow::Result<sha1::digest::Output<sha1::Sha1>> {
     // 1. Add the header
-    // 2. Hash the object and compress it at the same time (so we need to read the whole file once)
-    // 4. Write it to disk (to avoid loading the whole file in memory)
-    // 5. Rename it with the hash name
+    // 2. Hash the object and compress it at the same time (so we need to read the whole file once). The compression is directly writen to a tmp file to avoid loading the whole file in memory
+    // 5. Rename the temp file with the hash name
     Ok(if write {
-        // Getting length ahead won't work with stdin.
+        // Getting length ahead won't work with stdin. We also hope that the file don't get modified until we write it,
+        // otherwise we could encode a bad length
         let file_len = fs::metadata(file).context("get {file:?} metadata")?.len();
         let mut opened_file = fs::File::open(file).context("open {file:?}")?;
         let tmp_path = env::temp_dir().join("tempfile");
@@ -207,21 +220,23 @@ fn print_tree(hash: &str, name_only: bool) -> anyhow::Result<()> {
         }
 
         // Why they encode the mode in ASCII and not as an integer?
-        let mode = std::str::from_utf8(&mode_buf[..mode_buf.len() - 1])?;
+        let mode = std::str::from_utf8(&mode_buf[..mode_buf.len() - 1]).context("reading mode")?;
 
         let n = reader
             .read_until(0, &mut name_buf)
             .context("reading the header")?;
-        let name = CStr::from_bytes_with_nul(&name_buf[..n])?.to_str()?;
+        let name = CStr::from_bytes_with_nul(&name_buf[..n])
+            .context("reading name")?
+            .to_str()?;
 
-        reader.read_exact(&mut hash_buf)?;
+        reader.read_exact(&mut hash_buf).context("reading hash")?;
         let hex_hash = base16ct::lower::encode_string(&hash_buf);
         if name_only {
             writeln!(stdout, "{name}")?;
         } else {
             let object = Object::from_sha1(&hex_hash)?;
-            // In git on Linux (and windows for version >= V1.7.10) the CStr is encoded as UTF-8. However,
-            // git ls-tree won't print the unicode symbole if not ascii, it will escape the symbols in octal
+            // In git on Linux (and windows for version >= V1.7.10) the CStr is encoded as UTF-8. However, by default
+            // git ls-tree won't print the unicode symbole if not ASCII, it will escape the symbols in octal
             // representation.
             write!(stdout, "{mode:0>6} {object} {hex_hash}    ")?;
             for byte in name.as_bytes() {
