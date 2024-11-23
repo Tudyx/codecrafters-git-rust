@@ -2,6 +2,8 @@ use anyhow::{bail, ensure, Context};
 use clap::{Parser, Subcommand};
 use core::fmt;
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
+use hex_hash::GitHexHash;
+use jiff::Zoned;
 use sha1::{Digest, Sha1};
 use std::{
     env,
@@ -10,6 +12,8 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
 };
+
+mod hex_hash;
 
 fn main() {
     if let Err(err) = try_main() {
@@ -35,7 +39,7 @@ fn try_main() -> anyhow::Result<()> {
                 "We only handle the pretty print option -p for now"
             );
 
-            let object = ObjectReader::from_sha1(&hash)?;
+            let object = ObjectReader::from_sha1(hash)?;
             match object {
                 ObjectReader::Blob(mut reader) => {
                     io::copy(&mut reader, &mut io::stdout())
@@ -50,17 +54,20 @@ fn try_main() -> anyhow::Result<()> {
             println!("{sha1}");
         }
         Command::LsTree { hash, name_only } => {
-            ensure!(
-                hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()),
-                "Not a valid object name {hash}"
-            );
-            print_tree(&hash, name_only)?;
+            print_tree(hash, name_only)?;
         }
         Command::WriteTree => {
             let working_dir = env::current_dir()?;
             let sha1 = write_tree(&working_dir)?;
             let sha1 = base16ct::lower::encode_string(&sha1);
             println!("{sha1}");
+        }
+        Command::CommitTree {
+            tree_hash,
+            parent_hash,
+            message,
+        } => {
+            commit_tree(tree_hash, parent_hash, message)?;
         }
     };
     Ok(())
@@ -76,14 +83,20 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    Init,
-    // CatFile { hash: Box<[u8; 40]> },
     CatFile {
         /// SHA-1 hash of the object in hexadecimal representation.
-        hash: String,
-
+        #[arg(value_parser = parse_hash)]
+        hash: GitHexHash,
         #[arg(short)]
         pretty_print: bool,
+    },
+    CommitTree {
+        #[arg(value_parser = parse_hash)]
+        tree_hash: GitHexHash,
+        #[arg(short, long, value_parser = parse_hash)]
+        parent_hash: GitHexHash,
+        #[arg(short, long)]
+        message: String,
     },
     /// Create blob object from file.
     HashObject {
@@ -91,12 +104,18 @@ enum Command {
         #[arg(short)]
         write: bool,
     },
+    Init,
     LsTree {
-        hash: String,
+        #[arg(value_parser = parse_hash)]
+        hash: GitHexHash,
         #[arg(long)]
         name_only: bool,
     },
     WriteTree,
+}
+
+fn parse_hash(input: &str) -> anyhow::Result<GitHexHash> {
+    GitHexHash::try_from(input)
 }
 
 struct ObjectHasher<W> {
@@ -155,7 +174,7 @@ fn write_tree(dir: &Path) -> anyhow::Result<sha1::digest::Output<sha1::Sha1>> {
     let tmp_path = env::temp_dir().join("tmp_tree");
 
     let tmp = fs::File::create(&tmp_path)?;
-    // TODO: use a buf writer?
+    // We don't use `BufWriter` here because, quite surprisingly, ZlibEncoder `Write` implementation already use a buffer.
     let mut hasher = ObjectHasher {
         hash: Sha1::new(),
         writer: ZlibEncoder::new(tmp, Compression::default()),
@@ -187,10 +206,84 @@ fn write_tree(dir: &Path) -> anyhow::Result<sha1::digest::Output<sha1::Sha1>> {
     Ok(hash)
 }
 
+fn commit_tree(
+    tree_hash: GitHexHash,
+    parent_hash: GitHexHash,
+    message: String,
+) -> anyhow::Result<()> {
+    let tmp_path = env::temp_dir().join("tmp_tree");
+
+    let tmp = fs::File::create(&tmp_path)?;
+    // We don't use `BufWriter` here because, quite surprisingly, ZlibEncoder `Write` implementation already use a buffer.
+    let mut hasher = ObjectHasher {
+        hash: Sha1::new(),
+        writer: ZlibEncoder::new(tmp, Compression::default()),
+    };
+    const AUTHOR: &str = "John Doe";
+    const EMAIL: &str = "johndoe@example.com";
+    let now = jiff::Timestamp::now().as_second().to_string();
+    // TODO: find a way to padd this value like git
+    // 1732376559 +0100
+    let _offset = Zoned::now().offset().to_string();
+
+    // We pre-compute the length ahead of time so we don't have to write in a temporary buffer to compute the length.
+    let length: usize = 5 // tree
+        + 40
+        + 1
+        // parent
+        + 7
+        + 40
+        + 1
+        // author
+        + 7
+        + AUTHOR.as_bytes().len()
+        + 2
+        + EMAIL.as_bytes().len()
+        + 2
+        + now.len()
+        + 6
+        + 1
+        // commiter
+        + 9
+        + AUTHOR.as_bytes().len()
+        + 2
+        + EMAIL.as_bytes().len()
+        + 2
+        + now.len()
+        + 6
+        + 1
+        // new line
+        + 1
+        // message
+        + message.as_bytes().len()
+        // new line
+        + 1;
+    write!(hasher, "commit {length}\0")?;
+    writeln!(hasher, "tree {tree_hash}")?;
+    writeln!(hasher, "parent {parent_hash}")?;
+    writeln!(hasher, "author {AUTHOR} <{EMAIL}> {now} +0000")?;
+    writeln!(hasher, "commiter {AUTHOR} <{EMAIL}> {now} +0000")?;
+    writeln!(hasher)?;
+    writeln!(hasher, "{message}")?;
+    let _ = hasher.writer.finish()?;
+
+    let hash = hasher.hash.finalize();
+    let sha1 = base16ct::lower::encode_string(&hash);
+
+    let (dir, rest) = sha1.split_at(2);
+    let parent = PathBuf::from(".git/objects").join(dir);
+    let object_path = parent.join(rest);
+    fs::create_dir_all(&parent).context(format!("creating {parent:?}"))?;
+    fs::rename(tmp_path, object_path)?;
+
+    println!("{sha1}");
+    Ok(())
+}
+
 fn hash_object(file: &Path, write: bool) -> anyhow::Result<sha1::digest::Output<sha1::Sha1>> {
     // 1. Add the header
     // 2. Hash the object and compress it at the same time (so we need to read the whole file once). The compression is directly writen to a tmp file to avoid loading the whole file in memory
-    // 5. Rename the temp file with the hash name
+    // 3. Rename the temp file with the hash name
     Ok(if write {
         // Getting length ahead won't work with stdin. We also hope that the file don't get modified until we write it,
         // otherwise we could encode a bad length
@@ -228,8 +321,8 @@ fn hash_object(file: &Path, write: bool) -> anyhow::Result<sha1::digest::Output<
 }
 
 // Here there is not separator between the entries of the tree, they all start by a number but this could
-// be melt with the sha1 bytes, so we can't have a "split" approache. In other words the format is not self describing.
-fn print_tree(hash: &str, name_only: bool) -> anyhow::Result<()> {
+// be melted with the sha1 bytes, so we can't have a "split on separator" approach. In other words the format is not self describing.
+fn print_tree(hash: GitHexHash, name_only: bool) -> anyhow::Result<()> {
     let object = ObjectReader::from_sha1(hash)?;
 
     let ObjectReader::Tree(mut reader) = object else {
@@ -265,7 +358,7 @@ fn print_tree(hash: &str, name_only: bool) -> anyhow::Result<()> {
         if name_only {
             writeln!(stdout, "{name}")?;
         } else {
-            let object = ObjectReader::from_sha1(&hex_hash)?;
+            let object = ObjectReader::from_sha1(hex_hash.as_str().try_into()?)?;
             // In git on Linux (and windows for version >= V1.7.10) the CStr is encoded as UTF-8. However, by default
             // git ls-tree won't print the unicode symbole if not ASCII, it will escape the symbols in octal
             // representation.
@@ -288,21 +381,15 @@ fn print_tree(hash: &str, name_only: bool) -> anyhow::Result<()> {
 
 // Each object have an header
 // <kind> <size>\0
+// The size is the length of the content following the header.
 enum ObjectReader<R> {
     Blob(R),
     Tree(R),
 }
 
 impl ObjectReader<()> {
-    fn from_sha1(hash: &str) -> anyhow::Result<ObjectReader<impl BufRead>> {
-        // `hash` is the hex representation of 20 bytes so it size must be 40.
-        ensure!(
-            hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()),
-            "Not a valid object name {hash}"
-        );
-
-        let (dir, rest) = hash.split_at(2);
-        let object = PathBuf::from(".git/objects").join(dir).join(rest);
+    fn from_sha1(hash: GitHexHash) -> anyhow::Result<ObjectReader<impl BufRead>> {
+        let object = hash.to_path();
         let object = fs::File::open(&object).context(format!("opening {object:?}"))?;
         let z_decoder = ZlibDecoder::new(object);
         let mut z_decoder = BufReader::new(z_decoder);
