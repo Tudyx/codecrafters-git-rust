@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, ensure, Context};
+use anyhow::{bail, ensure, Context};
 use clap::{Parser, Subcommand};
 use core::fmt;
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
@@ -10,8 +10,6 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
 };
-
-// TODO: maybe I corrupted my git repository?
 
 fn main() {
     if let Err(err) = try_main() {
@@ -37,13 +35,13 @@ fn try_main() -> anyhow::Result<()> {
                 "We only handle the pretty print option -p for now"
             );
 
-            let object = Object::from_sha1(&hash)?;
+            let object = ObjectReader::from_sha1(&hash)?;
             match object {
-                Object::Blob(mut reader) => {
+                ObjectReader::Blob(mut reader) => {
                     io::copy(&mut reader, &mut io::stdout())
                         .context("piping object content to stdout")?;
                 }
-                Object::Tree(_) => bail!("we don't know how to print tree"),
+                ObjectReader::Tree(_) => bail!("we don't know how to print tree"),
             }
         }
         Command::HashObject { file, write } => {
@@ -66,6 +64,39 @@ fn try_main() -> anyhow::Result<()> {
         }
     };
     Ok(())
+}
+
+/// Simple program to greet a person
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    Init,
+    // CatFile { hash: Box<[u8; 40]> },
+    CatFile {
+        /// SHA-1 hash of the object in hexadecimal representation.
+        hash: String,
+
+        #[arg(short)]
+        pretty_print: bool,
+    },
+    /// Create blob object from file.
+    HashObject {
+        file: PathBuf,
+        #[arg(short)]
+        write: bool,
+    },
+    LsTree {
+        hash: String,
+        #[arg(long)]
+        name_only: bool,
+    },
+    WriteTree,
 }
 
 struct ObjectHasher<W> {
@@ -199,9 +230,9 @@ fn hash_object(file: &Path, write: bool) -> anyhow::Result<sha1::digest::Output<
 // Here there is not separator between the entries of the tree, they all start by a number but this could
 // be melt with the sha1 bytes, so we can't have a "split" approache. In other words the format is not self describing.
 fn print_tree(hash: &str, name_only: bool) -> anyhow::Result<()> {
-    let object = Object::from_sha1(hash)?;
+    let object = ObjectReader::from_sha1(hash)?;
 
-    let Object::Tree(mut reader) = object else {
+    let ObjectReader::Tree(mut reader) = object else {
         bail!("not a tree object");
     };
 
@@ -234,7 +265,7 @@ fn print_tree(hash: &str, name_only: bool) -> anyhow::Result<()> {
         if name_only {
             writeln!(stdout, "{name}")?;
         } else {
-            let object = Object::from_sha1(&hex_hash)?;
+            let object = ObjectReader::from_sha1(&hex_hash)?;
             // In git on Linux (and windows for version >= V1.7.10) the CStr is encoded as UTF-8. However, by default
             // git ls-tree won't print the unicode symbole if not ASCII, it will escape the symbols in octal
             // representation.
@@ -257,13 +288,13 @@ fn print_tree(hash: &str, name_only: bool) -> anyhow::Result<()> {
 
 // Each object have an header
 // <kind> <size>\0
-enum Object<R> {
+enum ObjectReader<R> {
     Blob(R),
     Tree(R),
 }
 
-impl Object<()> {
-    fn from_sha1(hash: &str) -> anyhow::Result<Object<impl BufRead>> {
+impl ObjectReader<()> {
+    fn from_sha1(hash: &str) -> anyhow::Result<ObjectReader<impl BufRead>> {
         // `hash` is the hex representation of 20 bytes so it size must be 40.
         ensure!(
             hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()),
@@ -286,51 +317,18 @@ impl Object<()> {
         // Takes protects from zip bomb.
         let object = z_decoder.take(size);
         Ok(match kind {
-            "blob" => Object::Blob(object),
-            "tree" => Object::Tree(object),
+            "blob" => ObjectReader::Blob(object),
+            "tree" => ObjectReader::Tree(object),
             _ => bail!("unknown object kind: {kind}"),
         })
     }
 }
 
-impl<R> fmt::Display for Object<R> {
+impl<R> fmt::Display for ObjectReader<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Object::Blob(_) => write!(f, "blob"),
-            Object::Tree(_) => write!(f, "tree"),
+            ObjectReader::Blob(_) => write!(f, "blob"),
+            ObjectReader::Tree(_) => write!(f, "tree"),
         }
     }
-}
-
-/// Simple program to greet a person
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand, Debug)]
-enum Command {
-    Init,
-    // CatFile { hash: Box<[u8; 40]> },
-    CatFile {
-        /// SHA-1 hash of the object in hexadecimal representation.
-        hash: String,
-
-        #[arg(short)]
-        pretty_print: bool,
-    },
-    /// Create blob object from file.
-    HashObject {
-        file: PathBuf,
-        #[arg(short)]
-        write: bool,
-    },
-    LsTree {
-        hash: String,
-        #[arg(long)]
-        name_only: bool,
-    },
-    WriteTree,
 }
